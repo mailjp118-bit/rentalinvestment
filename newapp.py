@@ -2,9 +2,7 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-import math
 import re
-import json
 from urllib.parse import quote_plus
 
 # ============================================================
@@ -23,6 +21,8 @@ HEADERS = {
     ),
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+REQUEST_TIMEOUT = 12
 
 CENSUS_GEOCODER_URL = "https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress"
 CENSUS_ACS_URL = "https://api.census.gov/data/2023/acs/acs5"
@@ -50,17 +50,7 @@ def fmt_money(x):
         return "$0"
 
 
-def fmt_pct(x):
-    try:
-        return f"{x:.1f}%"
-    except Exception:
-        return "0.0%"
-
-
 def monthly_mortgage_payment(loan_amount, annual_rate, years):
-    """
-    Standard amortizing mortgage formula.
-    """
     if loan_amount <= 0:
         return 0.0
     r = annual_rate / 12 / 100
@@ -70,32 +60,50 @@ def monthly_mortgage_payment(loan_amount, annual_rate, years):
     return loan_amount * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
 
 
-def fetch_url(url, params=None, timeout=20):
+def fetch_url(url, params=None, timeout=REQUEST_TIMEOUT, debug=False):
     try:
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=timeout)
-        st.write("Trying URL:", url)
-        st.write("Status code:", resp.status_code)
-        st.write("Final URL:", resp.url)
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=timeout, allow_redirects=True)
+        if debug:
+            st.write("Trying URL:", url)
+            st.write("Status code:", resp.status_code)
+            st.write("Final URL:", resp.url)
 
         resp.raise_for_status()
 
-        if not resp.text:
-            st.warning(f"No HTML returned from {url}")
+        if not resp.text or len(resp.text.strip()) == 0:
+            if debug:
+                st.warning(f"No HTML returned from {url}")
             return None
 
-        st.write("HTML length:", len(resp.text))
+        if debug:
+            st.write("HTML length:", len(resp.text))
+
         return resp.text
+    except requests.exceptions.Timeout:
+        if debug:
+            st.error(f"Timeout while fetching {url}")
+        return None
+    except requests.exceptions.RequestException as e:
+        if debug:
+            st.error(f"Failed to fetch {url}: {e}")
+        return None
     except Exception as e:
-        st.error(f"Failed to fetch {url}: {e}")
+        if debug:
+            st.error(f"Unexpected error for {url}: {e}")
         return None
 
 
-def fetch_json(url, params=None, timeout=20):
+def fetch_json(url, params=None, timeout=REQUEST_TIMEOUT, debug=False):
     try:
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=timeout)
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=timeout, allow_redirects=True)
+        if debug:
+            st.write("JSON URL:", url)
+            st.write("JSON status:", resp.status_code)
         resp.raise_for_status()
         return resp.json()
-    except Exception:
+    except Exception as e:
+        if debug:
+            st.error(f"JSON fetch failed for {url}: {e}")
         return None
 
 
@@ -114,14 +122,14 @@ def regex_money_from_text(text, patterns):
     return None
 
 
-def geocode_address_nominatim(address):
+def geocode_address_nominatim(address, debug=False):
     params = {
         "q": address,
         "format": "jsonv2",
         "limit": 1,
         "addressdetails": 1,
     }
-    data = fetch_json(NOMINATIM_URL, params=params, timeout=20)
+    data = fetch_json(NOMINATIM_URL, params=params, timeout=REQUEST_TIMEOUT, debug=debug)
     if not data:
         return {}
 
@@ -146,17 +154,14 @@ def geocode_address_nominatim(address):
     }
 
 
-def get_census_tract_and_income(address):
-    """
-    Uses Census geocoder + ACS 5-year median household income.
-    """
+def get_census_tract_and_income(address, debug=False):
     params = {
         "address": address,
         "benchmark": "Public_AR_Current",
         "vintage": "Current_Current",
         "format": "json",
     }
-    geo = fetch_json(CENSUS_GEOCODER_URL, params=params, timeout=20)
+    geo = fetch_json(CENSUS_GEOCODER_URL, params=params, timeout=REQUEST_TIMEOUT, debug=debug)
 
     if not geo:
         return {}
@@ -165,8 +170,8 @@ def get_census_tract_and_income(address):
         matches = geo["result"]["addressMatches"]
         if not matches:
             return {}
-        geographies = matches[0]["geographies"]["Census Tracts"][0]
 
+        geographies = matches[0]["geographies"]["Census Tracts"][0]
         state_fips = geographies["STATE"]
         county_fips = geographies["COUNTY"]
         tract_fips = geographies["TRACT"]
@@ -176,7 +181,7 @@ def get_census_tract_and_income(address):
             "for": f"tract:{tract_fips}",
             "in": f"state:{state_fips} county:{county_fips}",
         }
-        income_data = fetch_json(CENSUS_ACS_URL, params=income_params, timeout=20)
+        income_data = fetch_json(CENSUS_ACS_URL, params=income_params, timeout=REQUEST_TIMEOUT, debug=debug)
 
         median_income = None
         tract_name = None
@@ -197,15 +202,13 @@ def get_census_tract_and_income(address):
             "tract_name": tract_name,
             "median_household_income": median_income,
         }
-    except Exception:
+    except Exception as e:
+        if debug:
+            st.error(f"Census parsing failed: {e}")
         return {}
 
 
-def extract_zillow_data(address):
-    """
-    Best effort only.
-    Zillow may block this in some environments.
-    """
+def extract_zillow_data(address, debug=False):
     result = {
         "source": "Zillow",
         "search_url": f"https://www.zillow.com/homes/{quote_plus(address)}_rb/",
@@ -216,12 +219,11 @@ def extract_zillow_data(address):
         "status": "Not checked",
     }
 
-    html = fetch_url(result["search_url"], timeout=20)
+    html = fetch_url(result["search_url"], timeout=REQUEST_TIMEOUT, debug=debug)
     if not html:
         result["status"] = "Unable to fetch Zillow page"
         return result
 
-    # Try a few patterns often seen in Zillow HTML / JSON blobs
     price = regex_money_from_text(
         html,
         [
@@ -245,8 +247,6 @@ def extract_zillow_data(address):
             r'"hoaFee"\s*:\s*"?\$?([\d,]+)"?',
         ],
     )
-
-    # Property taxes are often harder to extract reliably from Zillow.
     tax = regex_money_from_text(
         html,
         [
@@ -263,11 +263,7 @@ def extract_zillow_data(address):
     return result
 
 
-def extract_trulia_data(address):
-    """
-    Best effort only.
-    Trulia frequently blocks automation.
-    """
+def extract_trulia_data(address, debug=False):
     result = {
         "source": "Trulia",
         "search_url": f"https://www.trulia.com/home/{quote_plus(address)}",
@@ -276,7 +272,7 @@ def extract_trulia_data(address):
         "status": "Not checked",
     }
 
-    html = fetch_url(result["search_url"], timeout=20)
+    html = fetch_url(result["search_url"], timeout=REQUEST_TIMEOUT, debug=debug)
     if not html:
         result["status"] = "Unable to fetch Trulia page"
         return result
@@ -293,7 +289,6 @@ def extract_trulia_data(address):
     soup = BeautifulSoup(html, "html.parser")
     page_text = soup.get_text(" ", strip=True).lower()
 
-    # simple neighborhood/renter-retention signal keywords
     keyword_hits = {
         "near schools": "near schools" in page_text,
         "quiet": "quiet" in page_text,
@@ -312,11 +307,7 @@ def extract_trulia_data(address):
     return result
 
 
-def extract_greatschools_data(address):
-    """
-    GreatSchools scraping is often blocked or HTML is dynamic.
-    This tries a basic search page lookup.
-    """
+def extract_greatschools_data(address, debug=False):
     result = {
         "source": "GreatSchools",
         "search_url": f"https://www.greatschools.org/search/search.page?q={quote_plus(address)}",
@@ -324,12 +315,11 @@ def extract_greatschools_data(address):
         "status": "Not checked",
     }
 
-    html = fetch_url(result["search_url"], timeout=20)
+    html = fetch_url(result["search_url"], timeout=REQUEST_TIMEOUT, debug=debug)
     if not html:
         result["status"] = "Unable to fetch GreatSchools page"
         return result
 
-    # Best-effort regex search for ratings like 7/10 or 8 out of 10
     patterns = [
         r'Elementary[^0-9]{0,120}(\d{1,2})\s*/\s*10',
         r'elementary[^0-9]{0,120}(\d{1,2})\s*out of\s*10',
@@ -369,9 +359,6 @@ def build_source_links(address, geo):
 
 
 def infer_rentability_score(trulia_notes, city_data_manual_note):
-    """
-    Best-effort qualitative score.
-    """
     score = 50
     text = f"{trulia_notes or ''} {city_data_manual_note or ''}".lower()
 
@@ -413,16 +400,13 @@ def crime_label(crime_manual_score):
     return "Low"
 
 
-# ============================================================
-# CACHED LOOKUPS
-# ============================================================
 @st.cache_data(show_spinner=False, ttl=3600)
-def analyze_sources(address):
-    geo = geocode_address_nominatim(address)
-    census = get_census_tract_and_income(address)
-    zillow = extract_zillow_data(address)
-    trulia = extract_trulia_data(address)
-    schools = extract_greatschools_data(address)
+def analyze_sources(address, debug=False):
+    geo = geocode_address_nominatim(address, debug=debug)
+    census = get_census_tract_and_income(address, debug=debug)
+    zillow = extract_zillow_data(address, debug=debug)
+    trulia = extract_trulia_data(address, debug=debug)
+    schools = extract_greatschools_data(address, debug=debug)
     links = build_source_links(address, geo)
 
     return {
@@ -433,7 +417,6 @@ def analyze_sources(address):
         "schools": schools,
         "links": links,
     }
-
 
 # ============================================================
 # UI
@@ -450,15 +433,11 @@ with left:
     )
 
 with right:
-    st.write("")
-    st.write("")
-    run_analysis = st.button("Analyze Property", type="primary", use_container_width=True)
+    debug_mode = st.checkbox("Debug Mode", value=False)
+    run_analysis = st.button("Analyze Property", type="primary", width="stretch")
 
 st.markdown("---")
 
-# ============================================================
-# DEFAULT INPUTS
-# ============================================================
 with st.expander("Financing & Manual Override Inputs", expanded=True):
     c1, c2, c3, c4 = st.columns(4)
 
@@ -488,7 +467,7 @@ with st.expander("Financing & Manual Override Inputs", expanded=True):
 # ============================================================
 if run_analysis and address.strip():
     with st.spinner("Researching property and calculating deal metrics..."):
-        data = analyze_sources(address.strip())
+        data = analyze_sources(address.strip(), debug=debug_mode)
 
     geo = data["geo"]
     census = data["census"]
@@ -497,9 +476,6 @@ if run_analysis and address.strip():
     schools = data["schools"]
     links = data["links"]
 
-    # ---------------------------
-    # Final inputs for calculation
-    # ---------------------------
     auto_price = zillow.get("price") or trulia.get("price")
     auto_rent = zillow.get("rent_estimate")
     auto_tax = zillow.get("property_tax_annual")
@@ -510,6 +486,18 @@ if run_analysis and address.strip():
     annual_tax = annual_tax_manual if annual_tax_manual > 0 else (auto_tax or 0.0)
     hoa_monthly = hoa_manual if hoa_manual > 0 else (auto_hoa or 0.0)
     annual_insurance = annual_insurance_manual
+
+    missing_items = []
+    if purchase_price <= 0:
+        missing_items.append("Purchase Price")
+    if estimated_rent <= 0:
+        missing_items.append("Estimated Rent")
+    if annual_tax <= 0:
+        missing_items.append("Annual Property Tax")
+
+    if missing_items:
+        st.warning("Could not automatically extract: " + ", ".join(missing_items))
+        st.info("Use the manual override fields above, then click Analyze Property again.")
 
     down_payment = purchase_price * 0.30
     loan_amount = purchase_price - down_payment
@@ -531,15 +519,14 @@ if run_analysis and address.strip():
 
     monthly_cash_flow = estimated_rent - total_monthly_payment
     gross_rent_yield = ((estimated_rent * 12) / purchase_price * 100) if purchase_price > 0 and estimated_rent > 0 else 0.0
-    cap_rate_proxy = (((estimated_rent * 12) - ((maintenance + vacancy + hoa_monthly) * 12) - annual_tax - annual_insurance) / purchase_price * 100) if purchase_price > 0 else 0.0
+    cap_rate_proxy = (
+        (((estimated_rent * 12) - ((maintenance + vacancy + hoa_monthly) * 12) - annual_tax - annual_insurance) / purchase_price * 100)
+        if purchase_price > 0 else 0.0
+    )
     rentability_score = infer_rentability_score(trulia.get("rentability_notes"), "")
     income = census.get("median_household_income")
-
     deal_verdict = verdict_label(monthly_cash_flow)
 
-    # ---------------------------
-    # Top summary
-    # ---------------------------
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Estimated Purchase Price", fmt_money(purchase_price))
     s2.metric("Estimated Monthly Rent", fmt_money(estimated_rent))
@@ -548,14 +535,10 @@ if run_analysis and address.strip():
 
     st.markdown("---")
 
-    # ---------------------------
-    # Property research section
-    # ---------------------------
     a1, a2 = st.columns([1.05, 0.95])
 
     with a1:
         st.subheader("Property Research")
-
         st.write("**Address entered:**", address)
         if geo.get("display_name"):
             st.write("**Geocoded location:**", geo.get("display_name"))
@@ -592,46 +575,15 @@ if run_analysis and address.strip():
                 "Status": "Manual score + review CommunityCrimeMap/Redfin links",
             },
         ])
-        st.dataframe(property_df, use_container_width=True, hide_index=True)
+        st.dataframe(property_df, width="stretch", hide_index=True)
 
         st.subheader("Deal Verdict")
         if deal_verdict == "Good Deal":
-            st.success(
-                f"**{deal_verdict}** — Estimated rent exceeds total monthly cost by {fmt_money(monthly_cash_flow)}."
-            )
+            st.success(f"**{deal_verdict}** — Estimated rent exceeds total monthly cost by {fmt_money(monthly_cash_flow)}.")
         elif deal_verdict == "Borderline Deal":
-            st.warning(
-                f"**{deal_verdict}** — Property is close to breakeven with estimated monthly cash flow of {fmt_money(monthly_cash_flow)}."
-            )
+            st.warning(f"**{deal_verdict}** — Property is close to breakeven with estimated monthly cash flow of {fmt_money(monthly_cash_flow)}.")
         else:
-            st.error(
-                f"**{deal_verdict}** — Estimated monthly cash flow is negative by {fmt_money(abs(monthly_cash_flow))}."
-            )
-
-        verdict_notes = []
-        if schools.get("elementary_rating") is not None:
-            if schools["elementary_rating"] >= 7:
-                verdict_notes.append("School rating appears supportive for family renters.")
-            elif schools["elementary_rating"] < 5:
-                verdict_notes.append("School rating may weaken long-term renter demand.")
-
-        if income:
-            rent_to_income = (estimated_rent * 12 / income * 100) if income > 0 and estimated_rent > 0 else None
-            if rent_to_income is not None:
-                verdict_notes.append(f"Estimated annual rent is about {rent_to_income:.1f}% of median household income.")
-
-        if rentability_score >= 65:
-            verdict_notes.append("Neighborhood signals suggest stronger long-term renter retainability.")
-        elif rentability_score < 45:
-            verdict_notes.append("Neighborhood signals suggest weaker renter retainability.")
-
-        if gross_rent_yield > 0:
-            verdict_notes.append(f"Gross rent yield is approximately {gross_rent_yield:.2f}%.")
-        if cap_rate_proxy > 0:
-            verdict_notes.append(f"Cap rate proxy is approximately {cap_rate_proxy:.2f}%.")
-
-        for note in verdict_notes:
-            st.write("-", note)
+            st.error(f"**{deal_verdict}** — Estimated monthly cash flow is negative by {fmt_money(abs(monthly_cash_flow))}.")
 
     with a2:
         st.subheader("Monthly Payment Breakdown")
@@ -646,7 +598,7 @@ if run_analysis and address.strip():
             {"Item": "Total Monthly Cost", "Monthly": total_monthly_payment},
         ])
         breakdown_df["Monthly"] = breakdown_df["Monthly"].map(fmt_money)
-        st.dataframe(breakdown_df, use_container_width=True, hide_index=True)
+        st.dataframe(breakdown_df, width="stretch", hide_index=True)
 
         st.subheader("Key Deal Ratios")
         r1, r2, r3 = st.columns(3)
@@ -667,45 +619,30 @@ if run_analysis and address.strip():
 
     st.markdown("---")
 
-    # ---------------------------
-    # Raw source extraction
-    # ---------------------------
-    st.subheader("Raw Extraction Results")
+    if debug_mode:
+        st.subheader("Raw Extraction Results")
 
-    c1, c2, c3 = st.columns(3)
+        c1, c2, c3 = st.columns(3)
 
-    with c1:
-        st.markdown("**Zillow**")
-        st.json({
-            "status": zillow.get("status"),
-            "price": zillow.get("price"),
-            "rent_estimate": zillow.get("rent_estimate"),
-            "property_tax_annual": zillow.get("property_tax_annual"),
-            "hoa_monthly": zillow.get("hoa_monthly"),
-            "search_url": zillow.get("search_url"),
-        })
+        with c1:
+            st.markdown("**Zillow**")
+            st.json(zillow)
 
-    with c2:
-        st.markdown("**Trulia**")
-        st.json({
-            "status": trulia.get("status"),
-            "price": trulia.get("price"),
-            "rentability_notes": trulia.get("rentability_notes"),
-            "search_url": trulia.get("search_url"),
-        })
+        with c2:
+            st.markdown("**Trulia**")
+            st.json(trulia)
 
-    with c3:
-        st.markdown("**GreatSchools / Census**")
-        st.json({
-            "greatschools_status": schools.get("status"),
-            "elementary_rating": schools.get("elementary_rating"),
-            "census_tract": census.get("tract_name"),
-            "median_household_income": census.get("median_household_income"),
-        })
+        with c3:
+            st.markdown("**GreatSchools / Census**")
+            st.json({
+                "greatschools_status": schools.get("status"),
+                "elementary_rating": schools.get("elementary_rating"),
+                "census_tract": census.get("tract_name"),
+                "median_household_income": census.get("median_household_income"),
+                "geo": geo,
+            })
 
-    st.info(
-        "Some sites may block automation. When that happens, use the source links above and enter manual overrides for price, taxes, HOA, or rent."
-    )
+    st.info("Some sites may block automation. When that happens, use the source links above and enter manual overrides for price, taxes, HOA, or rent.")
 
 elif run_analysis and not address.strip():
     st.warning("Please enter an address first.")
@@ -726,5 +663,4 @@ else:
         - Insurance is entered manually by default
         - Crime is best handled by reviewing CommunityCrimeMap and Redfin manually, then adjusting the crime score
         """
-
     )
