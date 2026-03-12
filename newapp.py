@@ -73,9 +73,20 @@ def monthly_mortgage_payment(loan_amount, annual_rate, years):
 def fetch_url(url, params=None, timeout=20):
     try:
         resp = requests.get(url, headers=HEADERS, params=params, timeout=timeout)
+        st.write("Trying URL:", url)
+        st.write("Status code:", resp.status_code)
+        st.write("Final URL:", resp.url)
+
         resp.raise_for_status()
+
+        if not resp.text:
+            st.warning(f"No HTML returned from {url}")
+            return None
+
+        st.write("HTML length:", len(resp.text))
         return resp.text
-    except Exception:
+    except Exception as e:
+        st.error(f"Failed to fetch {url}: {e}")
         return None
 
 
@@ -715,4 +726,5 @@ else:
         - Insurance is entered manually by default
         - Crime is best handled by reviewing CommunityCrimeMap and Redfin manually, then adjusting the crime score
         """
+
     )
