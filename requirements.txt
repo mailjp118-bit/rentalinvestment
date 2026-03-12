@@ -1,4 +1,4 @@
 streamlit
-reportlab
-openpyxl
-
+requests
+beautifulsoup4
+pandas
