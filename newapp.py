@@ -1,9 +1,8 @@
 import streamlit as st
 import requests
-from bs4 import BeautifulSoup
 import pandas as pd
-import re
-from urllib.parse import quote_plus
+import math
+from typing import Dict, Any
 
 # ============================================================
 # PAGE CONFIG
@@ -22,645 +21,467 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-REQUEST_TIMEOUT = 12
-
 CENSUS_GEOCODER_URL = "https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress"
 CENSUS_ACS_URL = "https://api.census.gov/data/2023/acs/acs5"
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 # ============================================================
 # HELPERS
 # ============================================================
 def safe_float(value, default=0.0):
     try:
-        if value is None:
+        if value in [None, "", "null"]:
             return default
-        if isinstance(value, (int, float)):
-            return float(value)
-        cleaned = str(value).replace("$", "").replace(",", "").replace("%", "").strip()
-        return float(cleaned)
+        return float(str(value).replace(",", "").replace("$", "").strip())
     except Exception:
         return default
 
 
-def fmt_money(x):
-    try:
-        return f"${x:,.0f}"
-    except Exception:
-        return "$0"
+def monthly_mortgage_payment(loan_amount: float, annual_rate: float, years: int = 30) -> float:
+    monthly_rate = annual_rate / 12 / 100
+    n = years * 12
 
-
-def monthly_mortgage_payment(loan_amount, annual_rate, years):
     if loan_amount <= 0:
         return 0.0
-    r = annual_rate / 12 / 100
-    n = years * 12
-    if r == 0:
+    if monthly_rate == 0:
         return loan_amount / n
-    return loan_amount * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
+
+    return loan_amount * (monthly_rate * (1 + monthly_rate) ** n) / ((1 + monthly_rate) ** n - 1)
 
 
-def fetch_url(url, params=None, timeout=REQUEST_TIMEOUT, debug=False):
-    try:
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=timeout, allow_redirects=True)
-        if debug:
-            st.write("Trying URL:", url)
-            st.write("Status code:", resp.status_code)
-            st.write("Final URL:", resp.url)
-
-        resp.raise_for_status()
-
-        if not resp.text or len(resp.text.strip()) == 0:
-            if debug:
-                st.warning(f"No HTML returned from {url}")
-            return None
-
-        if debug:
-            st.write("HTML length:", len(resp.text))
-
-        return resp.text
-    except requests.exceptions.Timeout:
-        if debug:
-            st.error(f"Timeout while fetching {url}")
-        return None
-    except requests.exceptions.RequestException as e:
-        if debug:
-            st.error(f"Failed to fetch {url}: {e}")
-        return None
-    except Exception as e:
-        if debug:
-            st.error(f"Unexpected error for {url}: {e}")
-        return None
-
-
-def fetch_json(url, params=None, timeout=REQUEST_TIMEOUT, debug=False):
-    try:
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=timeout, allow_redirects=True)
-        if debug:
-            st.write("JSON URL:", url)
-            st.write("JSON status:", resp.status_code)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        if debug:
-            st.error(f"JSON fetch failed for {url}: {e}")
-        return None
-
-
-def regex_money_from_text(text, patterns):
-    if not text:
-        return None
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-        if match:
-            raw = match.group(1)
-            raw = raw.replace(",", "").replace("$", "").strip()
-            try:
-                return float(raw)
-            except Exception:
-                pass
-    return None
-
-
-def geocode_address_nominatim(address, debug=False):
-    params = {
-        "q": address,
-        "format": "jsonv2",
-        "limit": 1,
-        "addressdetails": 1,
-    }
-    data = fetch_json(NOMINATIM_URL, params=params, timeout=REQUEST_TIMEOUT, debug=debug)
-    if not data:
-        return {}
-
-    row = data[0]
-    address_info = row.get("address", {})
-
-    return {
-        "lat": safe_float(row.get("lat")),
-        "lon": safe_float(row.get("lon")),
-        "display_name": row.get("display_name", ""),
-        "city": (
-            address_info.get("city")
-            or address_info.get("town")
-            or address_info.get("village")
-            or address_info.get("hamlet")
-            or address_info.get("county")
-            or ""
-        ),
-        "county": address_info.get("county", ""),
-        "state": address_info.get("state", ""),
-        "postcode": address_info.get("postcode", ""),
-    }
-
-
-def get_census_tract_and_income(address, debug=False):
-    params = {
-        "address": address,
-        "benchmark": "Public_AR_Current",
-        "vintage": "Current_Current",
-        "format": "json",
-    }
-    geo = fetch_json(CENSUS_GEOCODER_URL, params=params, timeout=REQUEST_TIMEOUT, debug=debug)
-
-    if not geo:
-        return {}
-
-    try:
-        matches = geo["result"]["addressMatches"]
-        if not matches:
-            return {}
-
-        geographies = matches[0]["geographies"]["Census Tracts"][0]
-        state_fips = geographies["STATE"]
-        county_fips = geographies["COUNTY"]
-        tract_fips = geographies["TRACT"]
-
-        income_params = {
-            "get": "NAME,B19013_001E",
-            "for": f"tract:{tract_fips}",
-            "in": f"state:{state_fips} county:{county_fips}",
-        }
-        income_data = fetch_json(CENSUS_ACS_URL, params=income_params, timeout=REQUEST_TIMEOUT, debug=debug)
-
-        median_income = None
-        tract_name = None
-
-        if income_data and len(income_data) > 1:
-            headers = income_data[0]
-            values = income_data[1]
-            row = dict(zip(headers, values))
-            tract_name = row.get("NAME")
-            income_raw = row.get("B19013_001E")
-            if income_raw not in (None, "-666666666", "-999999999"):
-                median_income = safe_float(income_raw, None)
-
-        return {
-            "state_fips": state_fips,
-            "county_fips": county_fips,
-            "tract_fips": tract_fips,
-            "tract_name": tract_name,
-            "median_household_income": median_income,
-        }
-    except Exception as e:
-        if debug:
-            st.error(f"Census parsing failed: {e}")
-        return {}
-
-
-def extract_zillow_data(address, debug=False):
-    result = {
-        "source": "Zillow",
-        "search_url": f"https://www.zillow.com/homes/{quote_plus(address)}_rb/",
-        "price": None,
-        "rent_estimate": None,
-        "property_tax_annual": None,
-        "hoa_monthly": None,
-        "status": "Not checked",
-    }
-
-    html = fetch_url(result["search_url"], timeout=REQUEST_TIMEOUT, debug=debug)
-    if not html:
-        result["status"] = "Unable to fetch Zillow page"
-        return result
-
-    price = regex_money_from_text(
-        html,
-        [
-            r'"price"\s*:\s*"?\$?([\d,]+)"?',
-            r'"unformattedPrice"\s*:\s*([\d,]+)',
-            r'"priceValue"\s*:\s*([\d,]+)',
-        ],
-    )
-    rent = regex_money_from_text(
-        html,
-        [
-            r'"rentZestimate"\s*:\s*([\d,]+)',
-            r'"rentEstimate"\s*:\s*([\d,]+)',
-            r'"zestimateRentalPrice"\s*:\s*([\d,]+)',
-        ],
-    )
-    hoa = regex_money_from_text(
-        html,
-        [
-            r'"monthlyHoaFee"\s*:\s*([\d,]+)',
-            r'"hoaFee"\s*:\s*"?\$?([\d,]+)"?',
-        ],
-    )
-    tax = regex_money_from_text(
-        html,
-        [
-            r'"taxAnnualAmount"\s*:\s*([\d,]+)',
-            r'"annualTaxAmount"\s*:\s*([\d,]+)',
-        ],
-    )
-
-    result["price"] = price
-    result["rent_estimate"] = rent
-    result["hoa_monthly"] = hoa
-    result["property_tax_annual"] = tax
-    result["status"] = "Fetched" if any([price, rent, hoa, tax]) else "Fetched page, no values parsed"
-    return result
-
-
-def extract_trulia_data(address, debug=False):
-    result = {
-        "source": "Trulia",
-        "search_url": f"https://www.trulia.com/home/{quote_plus(address)}",
-        "price": None,
-        "rentability_notes": None,
-        "status": "Not checked",
-    }
-
-    html = fetch_url(result["search_url"], timeout=REQUEST_TIMEOUT, debug=debug)
-    if not html:
-        result["status"] = "Unable to fetch Trulia page"
-        return result
-
-    price = regex_money_from_text(
-        html,
-        [
-            r'"price"\s*:\s*"?\$?([\d,]+)"?',
-            r'"formattedPrice"\s*:\s*"?\$?([\d,]+)"?',
-        ],
-    )
-
-    notes = []
-    soup = BeautifulSoup(html, "html.parser")
-    page_text = soup.get_text(" ", strip=True).lower()
-
-    keyword_hits = {
-        "near schools": "near schools" in page_text,
-        "quiet": "quiet" in page_text,
-        "walkable": "walkable" in page_text,
-        "transit": "transit" in page_text,
-        "shopping": "shopping" in page_text,
-        "family friendly": "family friendly" in page_text,
-    }
-    for k, v in keyword_hits.items():
-        if v:
-            notes.append(k)
-
-    result["price"] = price
-    result["rentability_notes"] = ", ".join(notes) if notes else None
-    result["status"] = "Fetched" if (price or notes) else "Fetched page, limited parsing"
-    return result
-
-
-def extract_greatschools_data(address, debug=False):
-    result = {
-        "source": "GreatSchools",
-        "search_url": f"https://www.greatschools.org/search/search.page?q={quote_plus(address)}",
-        "elementary_rating": None,
-        "status": "Not checked",
-    }
-
-    html = fetch_url(result["search_url"], timeout=REQUEST_TIMEOUT, debug=debug)
-    if not html:
-        result["status"] = "Unable to fetch GreatSchools page"
-        return result
-
-    patterns = [
-        r'Elementary[^0-9]{0,120}(\d{1,2})\s*/\s*10',
-        r'elementary[^0-9]{0,120}(\d{1,2})\s*out of\s*10',
-        r'"rating"\s*:\s*"(\d{1,2})/10"',
-    ]
-
-    for p in patterns:
-        m = re.search(p, html, re.IGNORECASE | re.DOTALL)
-        if m:
-            result["elementary_rating"] = safe_float(m.group(1), None)
-            break
-
-    result["status"] = "Fetched" if result["elementary_rating"] is not None else "Fetched page, rating not parsed"
-    return result
-
-
-def build_source_links(address, geo):
-    city = geo.get("city", "")
-    state = geo.get("state", "")
-    zipcode = geo.get("postcode", "")
-    county = geo.get("county", "")
-
-    location_text = " ".join([x for x in [city, state, zipcode] if x]).strip()
-    county_state = " ".join([x for x in [county, state] if x]).strip()
-
-    return {
-        "Zillow": f"https://www.zillow.com/homes/{quote_plus(address)}_rb/",
-        "Trulia": f"https://www.trulia.com/home/{quote_plus(address)}",
-        "GreatSchools": f"https://www.greatschools.org/search/search.page?q={quote_plus(address)}",
-        "CommunityCrimeMap": f"https://communitycrimemap.com/?address={quote_plus(address)}",
-        "Redfin Search": f"https://www.redfin.com/search?q={quote_plus(address)}",
-        "City-Data": f"https://www.city-data.com/search/search.php?qs={quote_plus(location_text or address)}",
-        "Census Reporter": f"https://censusreporter.org/search/?q={quote_plus(location_text or county_state or address)}",
-        "Data Census": "https://data.census.gov/",
-        "Redfin Data Center": "https://www.redfin.com/news/data-center/",
-    }
-
-
-def infer_rentability_score(trulia_notes, city_data_manual_note):
-    score = 50
-    text = f"{trulia_notes or ''} {city_data_manual_note or ''}".lower()
-
-    positive_terms = [
-        "quiet", "walkable", "shopping", "transit",
-        "family friendly", "stable", "good schools",
-        "owner occupied", "long-term", "low turnover"
-    ]
-    negative_terms = [
-        "high crime", "vacancy", "turnover", "noisy",
-        "unstable", "declining", "blight", "unsafe"
-    ]
-
-    for term in positive_terms:
-        if term in text:
-            score += 8
-    for term in negative_terms:
-        if term in text:
-            score -= 10
-
-    return max(0, min(100, score))
-
-
-def verdict_label(cash_flow):
-    if cash_flow >= 300:
+def get_verdict(cash_flow: float) -> str:
+    if cash_flow >= 200:
         return "Good Deal"
-    if cash_flow >= 0:
+    elif cash_flow >= 0:
         return "Borderline Deal"
     return "Bad Deal"
 
 
-def crime_label(crime_manual_score):
-    if crime_manual_score is None:
-        return "Unknown"
-    if crime_manual_score >= 70:
-        return "High"
-    if crime_manual_score >= 40:
-        return "Moderate"
-    return "Low"
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def analyze_sources(address, debug=False):
-    geo = geocode_address_nominatim(address, debug=debug)
-    census = get_census_tract_and_income(address, debug=debug)
-    zillow = extract_zillow_data(address, debug=debug)
-    trulia = extract_trulia_data(address, debug=debug)
-    schools = extract_greatschools_data(address, debug=debug)
-    links = build_source_links(address, geo)
-
-    return {
-        "geo": geo,
-        "census": census,
-        "zillow": zillow,
-        "trulia": trulia,
-        "schools": schools,
-        "links": links,
+# ============================================================
+# API FUNCTIONS
+# ============================================================
+def get_census_geo(address: str) -> Dict[str, Any]:
+    params = {
+        "address": address,
+        "benchmark": "Public_AR_Current",
+        "vintage": "Current_Current",
+        "layers": "Census Tracts",
+        "format": "json",
     }
 
+    try:
+        r = requests.get(CENSUS_GEOCODER_URL, params=params, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+
+        matches = data.get("result", {}).get("addressMatches", [])
+        if not matches:
+            return {"success": False, "error": "No geocoder match found."}
+
+        geo = matches[0]
+        geos = geo.get("geographies", {})
+        tracts = geos.get("Census Tracts", [])
+
+        if not tracts:
+            return {"success": False, "error": "No census tract found."}
+
+        tract = tracts[0]
+
+        return {
+            "success": True,
+            "matched_address": geo.get("matchedAddress"),
+            "state_fips": tract.get("STATE"),
+            "county_fips": tract.get("COUNTY"),
+            "tract_code": tract.get("TRACT"),
+            "county_name": tract.get("COUNTYNAME"),
+            "state_name": tract.get("STATENAME"),
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def get_household_income(state_fips: str, county_fips: str, tract_code: str) -> Dict[str, Any]:
+    params = {
+        "get": "NAME,B19013_001E",
+        "for": f"tract:{tract_code}",
+        "in": f"state:{state_fips} county:{county_fips}",
+    }
+
+    try:
+        r = requests.get(CENSUS_ACS_URL, params=params, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+
+        if len(data) < 2:
+            return {"success": False, "error": "Income data not found."}
+
+        row = data[1]
+        return {
+            "success": True,
+            "name": row[0],
+            "median_household_income": safe_float(row[1], 0.0),
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 # ============================================================
-# UI
+# OPTIONAL PLACEHOLDER FETCHERS
+# These do not break the app if websites block scraping
 # ============================================================
-st.title("🏠 Rental Investment Analyzer")
-st.caption("Enter a property address. The app will try to research the property and estimate whether it is a good rental deal.")
+def try_fetch_rent_placeholder(address: str) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "error": "Automatic rent fetch not configured. Enter rent manually."
+    }
 
-left, right = st.columns([1.1, 0.9])
 
-with left:
-    address = st.text_input(
-        "Address",
-        placeholder="3751 Oakwood Manor, Decatur, GA 30032",
-    )
+def try_fetch_school_placeholder(address: str) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "error": "Automatic school fetch not configured. Enter school info manually."
+    }
 
-with right:
-    debug_mode = st.checkbox("Debug Mode", value=False)
-    run_analysis = st.button("Analyze Property", type="primary", width="stretch")
 
-st.markdown("---")
+def try_fetch_crime_placeholder(address: str) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "error": "Automatic crime fetch not configured. Enter crime note manually."
+    }
 
-with st.expander("Financing & Manual Override Inputs", expanded=True):
-    c1, c2, c3, c4 = st.columns(4)
 
-    with c1:
-        interest_rate = st.number_input("Interest Rate (%)", min_value=0.0, max_value=20.0, value=7.0, step=0.1)
-        loan_years = st.number_input("Loan Term (Years)", min_value=1, max_value=40, value=30, step=1)
+def try_fetch_retainability_placeholder(address: str) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "error": "Automatic renter retainability fetch not configured. Enter note manually."
+    }
 
-    with c2:
-        annual_insurance_manual = st.number_input("Annual Insurance ($)", min_value=0.0, value=1800.0, step=100.0)
-        hoa_manual = st.number_input("Monthly HOA ($)", min_value=0.0, value=0.0, step=25.0)
-
-    with c3:
-        property_price_manual = st.number_input("Manual Purchase Price Override ($)", min_value=0.0, value=0.0, step=1000.0)
-        annual_tax_manual = st.number_input("Manual Annual Property Tax Override ($)", min_value=0.0, value=0.0, step=100.0)
-
-    with c4:
-        rent_manual = st.number_input("Manual Estimated Rent Override ($/mo)", min_value=0.0, value=0.0, step=50.0)
-        crime_manual_score = st.slider(
-            "Crime Risk Score (manual, 0=low / 100=high)",
-            min_value=0, max_value=100, value=50
-        )
-
-    st.caption("Use overrides when a site blocks automated extraction or when you want to use your own numbers.")
 
 # ============================================================
-# ANALYSIS
+# CALCULATIONS
 # ============================================================
-if run_analysis and address.strip():
-    with st.spinner("Researching property and calculating deal metrics..."):
-        data = analyze_sources(address.strip(), debug=debug_mode)
-
-    geo = data["geo"]
-    census = data["census"]
-    zillow = data["zillow"]
-    trulia = data["trulia"]
-    schools = data["schools"]
-    links = data["links"]
-
-    auto_price = zillow.get("price") or trulia.get("price")
-    auto_rent = zillow.get("rent_estimate")
-    auto_tax = zillow.get("property_tax_annual")
-    auto_hoa = zillow.get("hoa_monthly")
-
-    purchase_price = property_price_manual if property_price_manual > 0 else (auto_price or 0.0)
-    estimated_rent = rent_manual if rent_manual > 0 else (auto_rent or 0.0)
-    annual_tax = annual_tax_manual if annual_tax_manual > 0 else (auto_tax or 0.0)
-    hoa_monthly = hoa_manual if hoa_manual > 0 else (auto_hoa or 0.0)
-    annual_insurance = annual_insurance_manual
-
-    missing_items = []
-    if purchase_price <= 0:
-        missing_items.append("Purchase Price")
-    if estimated_rent <= 0:
-        missing_items.append("Estimated Rent")
-    if annual_tax <= 0:
-        missing_items.append("Annual Property Tax")
-
-    if missing_items:
-        st.warning("Could not automatically extract: " + ", ".join(missing_items))
-        st.info("Use the manual override fields above, then click Analyze Property again.")
-
-    down_payment = purchase_price * 0.30
+def calculate_rental_metrics(
+    purchase_price: float,
+    down_payment_pct: float,
+    interest_rate: float,
+    property_tax_annual: float,
+    insurance_annual: float,
+    hoa_monthly: float,
+    estimated_rent: float,
+    maintenance_pct: float = 10.0,
+    vacancy_pct: float = 10.0,
+):
+    down_payment = purchase_price * (down_payment_pct / 100)
     loan_amount = purchase_price - down_payment
-    mortgage_pi = monthly_mortgage_payment(loan_amount, interest_rate, loan_years)
 
-    monthly_tax = annual_tax / 12 if annual_tax else 0.0
-    monthly_insurance = annual_insurance / 12 if annual_insurance else 0.0
-    maintenance = estimated_rent * 0.10 if estimated_rent else 0.0
-    vacancy = estimated_rent * 0.10 if estimated_rent else 0.0
+    mortgage_pi = monthly_mortgage_payment(loan_amount, interest_rate, years=30)
+    tax_monthly = property_tax_annual / 12
+    insurance_monthly = insurance_annual / 12
+    maintenance_monthly = estimated_rent * (maintenance_pct / 100)
+    vacancy_monthly = estimated_rent * (vacancy_pct / 100)
 
-    total_monthly_payment = (
+    total_monthly_cost = (
         mortgage_pi
-        + monthly_tax
-        + monthly_insurance
+        + tax_monthly
+        + insurance_monthly
         + hoa_monthly
-        + maintenance
-        + vacancy
+        + maintenance_monthly
+        + vacancy_monthly
     )
 
-    monthly_cash_flow = estimated_rent - total_monthly_payment
-    gross_rent_yield = ((estimated_rent * 12) / purchase_price * 100) if purchase_price > 0 and estimated_rent > 0 else 0.0
-    cap_rate_proxy = (
-        (((estimated_rent * 12) - ((maintenance + vacancy + hoa_monthly) * 12) - annual_tax - annual_insurance) / purchase_price * 100)
-        if purchase_price > 0 else 0.0
+    cash_flow = estimated_rent - total_monthly_cost
+
+    return {
+        "down_payment": down_payment,
+        "loan_amount": loan_amount,
+        "mortgage_pi": mortgage_pi,
+        "tax_monthly": tax_monthly,
+        "insurance_monthly": insurance_monthly,
+        "hoa_monthly": hoa_monthly,
+        "maintenance_monthly": maintenance_monthly,
+        "vacancy_monthly": vacancy_monthly,
+        "total_monthly_cost": total_monthly_cost,
+        "estimated_rent": estimated_rent,
+        "cash_flow": cash_flow,
+    }
+
+
+# ============================================================
+# SESSION STATE DEFAULTS
+# ============================================================
+default_values = {
+    "geo": {},
+    "income": {},
+    "rent_fetch": {},
+    "school_fetch": {},
+    "crime_fetch": {},
+    "retain_fetch": {},
+}
+
+for key, value in default_values.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+# ============================================================
+# TOP BAR
+# ============================================================
+top_left, top_middle, top_right = st.columns([5, 2, 2])
+
+with top_left:
+    st.title("🏠 Rental Investment Analyzer")
+
+with top_middle:
+    st.markdown("###")
+    st.caption("Hybrid API + Manual Input")
+
+with top_right:
+    st.markdown("###")
+    st.caption("More reliable than scraping-only")
+
+# ============================================================
+# PRIVACY MESSAGE
+# ============================================================
+st.markdown(
+    """
+    🔒 **Privacy Notice:**  
+    *This tool does not depend on scraping every site to work. Reliable data is fetched by API where possible, and missing items can be entered manually.*
+    """
+)
+
+# ============================================================
+# MAIN LAYOUT
+# ============================================================
+left_col, mid_col, right_col = st.columns([1.15, 1, 1])
+
+# ============================================================
+# LEFT COLUMN - INPUTS
+# ============================================================
+with left_col:
+    st.subheader("🔢 Deal Inputs")
+
+    address = st.text_area(
+        "Property Address",
+        value="1394 Stephens Pond Vw, Loganville, GA 30052",
+        height=70
     )
-    rentability_score = infer_rentability_score(trulia.get("rentability_notes"), "")
-    income = census.get("median_household_income")
-    deal_verdict = verdict_label(monthly_cash_flow)
 
-    s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Estimated Purchase Price", fmt_money(purchase_price))
-    s2.metric("Estimated Monthly Rent", fmt_money(estimated_rent))
-    s3.metric("Total Monthly Cost", fmt_money(total_monthly_payment))
-    s4.metric("Monthly Cash Flow", fmt_money(monthly_cash_flow))
+    purchase_price = st.number_input("Purchase Price ($)", min_value=0.0, value=310000.0, step=1000.0)
+    down_payment_pct = st.number_input("Down Payment (%)", min_value=0.0, max_value=100.0, value=30.0, step=1.0)
+    interest_rate = st.number_input("Interest Rate (%)", min_value=0.0, value=6.75, step=0.1)
 
-    st.markdown("---")
+    property_tax_annual = st.number_input("Annual Property Tax ($)", min_value=0.0, value=3576.0, step=100.0)
+    insurance_annual = st.number_input("Annual Insurance ($)", min_value=0.0, value=1584.0, step=100.0)
+    hoa_monthly = st.number_input("HOA Monthly ($)", min_value=0.0, value=38.0, step=5.0)
 
-    a1, a2 = st.columns([1.05, 0.95])
+    estimated_rent = st.number_input("Estimated Monthly Rent ($)", min_value=0.0, value=2059.0, step=50.0)
 
-    with a1:
-        st.subheader("Property Research")
-        st.write("**Address entered:**", address)
-        if geo.get("display_name"):
-            st.write("**Geocoded location:**", geo.get("display_name"))
+    st.subheader("📝 Manual Notes / Optional Inputs")
+    elementary_school = st.text_input("Elementary School", value="Magill Elementary")
+    school_rating = st.text_input("School Rating", value="")
+    crime_note = st.text_input("Crime Note", value="")
+    retainability_note = st.text_input("Renter Retainability", value="")
+    time_to_rent = st.text_input("Time to Rent", value="")
 
-        property_df = pd.DataFrame([
-            {
-                "Category": "Zillow price",
-                "Value": fmt_money(zillow.get("price")) if zillow.get("price") else "Not found",
-                "Status": zillow.get("status"),
-            },
-            {
-                "Category": "Zillow rent estimate",
-                "Value": fmt_money(zillow.get("rent_estimate")) if zillow.get("rent_estimate") else "Not found",
-                "Status": zillow.get("status"),
-            },
-            {
-                "Category": "GreatSchools elementary rating",
-                "Value": f"{schools.get('elementary_rating')}/10" if schools.get("elementary_rating") is not None else "Not found",
-                "Status": schools.get("status"),
-            },
-            {
-                "Category": "Median household income",
-                "Value": fmt_money(income) if income else "Not found",
-                "Status": "From Census ACS via tract lookup" if income else "Not found",
-            },
-            {
-                "Category": "Rentability score",
-                "Value": f"{rentability_score}/100",
-                "Status": "Best-effort signal from available neighborhood text",
-            },
-            {
-                "Category": "Crime level",
-                "Value": crime_label(crime_manual_score),
-                "Status": "Manual score + review CommunityCrimeMap/Redfin links",
-            },
-        ])
-        st.dataframe(property_df, width="stretch", hide_index=True)
+    st.subheader("🌐 Fetch Tools")
 
-        st.subheader("Deal Verdict")
-        if deal_verdict == "Good Deal":
-            st.success(f"**{deal_verdict}** — Estimated rent exceeds total monthly cost by {fmt_money(monthly_cash_flow)}.")
-        elif deal_verdict == "Borderline Deal":
-            st.warning(f"**{deal_verdict}** — Property is close to breakeven with estimated monthly cash flow of {fmt_money(monthly_cash_flow)}.")
+    if st.button("Fetch Census Geography + Household Income", use_container_width=True):
+        geo = get_census_geo(address)
+        st.session_state["geo"] = geo
+
+        if geo.get("success"):
+            income = get_household_income(
+                geo["state_fips"],
+                geo["county_fips"],
+                geo["tract_code"]
+            )
+            st.session_state["income"] = income
         else:
-            st.error(f"**{deal_verdict}** — Estimated monthly cash flow is negative by {fmt_money(abs(monthly_cash_flow))}.")
+            st.session_state["income"] = {"success": False, "error": "Skipped because geocoding failed."}
 
-    with a2:
-        st.subheader("Monthly Payment Breakdown")
+    if st.button("Try Fetch Rent", use_container_width=True):
+        st.session_state["rent_fetch"] = try_fetch_rent_placeholder(address)
 
-        breakdown_df = pd.DataFrame([
-            {"Item": "Mortgage + Interest", "Monthly": mortgage_pi},
-            {"Item": "Property Tax", "Monthly": monthly_tax},
-            {"Item": "Insurance", "Monthly": monthly_insurance},
-            {"Item": "HOA", "Monthly": hoa_monthly},
-            {"Item": "Maintenance (10% of rent)", "Monthly": maintenance},
-            {"Item": "Vacancy (10% of rent)", "Monthly": vacancy},
-            {"Item": "Total Monthly Cost", "Monthly": total_monthly_payment},
-        ])
-        breakdown_df["Monthly"] = breakdown_df["Monthly"].map(fmt_money)
-        st.dataframe(breakdown_df, width="stretch", hide_index=True)
+    if st.button("Try Fetch School Info", use_container_width=True):
+        st.session_state["school_fetch"] = try_fetch_school_placeholder(address)
 
-        st.subheader("Key Deal Ratios")
-        r1, r2, r3 = st.columns(3)
-        r1.metric("Down Payment (30%)", fmt_money(down_payment))
-        r2.metric("Gross Rent Yield", f"{gross_rent_yield:.2f}%")
-        r3.metric("Cap Rate Proxy", f"{cap_rate_proxy:.2f}%")
+    if st.button("Try Fetch Crime", use_container_width=True):
+        st.session_state["crime_fetch"] = try_fetch_crime_placeholder(address)
 
-        st.subheader("Source Links")
-        st.markdown(f"- [Zillow]({links['Zillow']})")
-        st.markdown(f"- [Trulia]({links['Trulia']})")
-        st.markdown(f"- [GreatSchools]({links['GreatSchools']})")
-        st.markdown(f"- [CommunityCrimeMap]({links['CommunityCrimeMap']})")
-        st.markdown(f"- [Redfin Search]({links['Redfin Search']})")
-        st.markdown(f"- [City-Data]({links['City-Data']})")
-        st.markdown(f"- [Census Reporter]({links['Census Reporter']})")
-        st.markdown(f"- [Data Census]({links['Data Census']})")
-        st.markdown(f"- [Redfin Data Center]({links['Redfin Data Center']})")
+    if st.button("Try Fetch Retainability", use_container_width=True):
+        st.session_state["retain_fetch"] = try_fetch_retainability_placeholder(address)
 
-    st.markdown("---")
+# ============================================================
+# CALCULATIONS
+# ============================================================
+metrics = calculate_rental_metrics(
+    purchase_price=purchase_price,
+    down_payment_pct=down_payment_pct,
+    interest_rate=interest_rate,
+    property_tax_annual=property_tax_annual,
+    insurance_annual=insurance_annual,
+    hoa_monthly=hoa_monthly,
+    estimated_rent=estimated_rent,
+)
 
-    if debug_mode:
-        st.subheader("Raw Extraction Results")
+verdict = get_verdict(metrics["cash_flow"])
+income_value = st.session_state.get("income", {}).get("median_household_income", None)
+geo = st.session_state.get("geo", {})
+income = st.session_state.get("income", {})
+rent_fetch = st.session_state.get("rent_fetch", {})
+school_fetch = st.session_state.get("school_fetch", {})
+crime_fetch = st.session_state.get("crime_fetch", {})
+retain_fetch = st.session_state.get("retain_fetch", {})
 
-        c1, c2, c3 = st.columns(3)
+# ============================================================
+# MIDDLE COLUMN - PROPERTY DETAILS + RENT VS EXPENSES
+# ============================================================
+with mid_col:
+    st.subheader("📋 Property Details")
 
-        with c1:
-            st.markdown("**Zillow**")
-            st.json(zillow)
+    details_df = pd.DataFrame({
+        "Category": [
+            "Property Address",
+            "Estimated Purchase Price",
+            "Down Payment",
+            "Loan Amount",
+            "Elementary School",
+            "GreatSchools Rating",
+            "Crime Note",
+            "Renter Retainability",
+            "Median Household Income",
+            "Time to Rent",
+        ],
+        "Data / Estimate": [
+            address,
+            f"${purchase_price:,.0f}",
+            f"${metrics['down_payment']:,.0f}",
+            f"${metrics['loan_amount']:,.0f}",
+            elementary_school if elementary_school else "Not entered",
+            school_rating if school_rating else "Not entered",
+            crime_note if crime_note else "Not entered",
+            retainability_note if retainability_note else "Not entered",
+            f"${income_value:,.0f}" if income_value else "Not fetched",
+            time_to_rent if time_to_rent else "Not entered",
+        ]
+    })
 
-        with c2:
-            st.markdown("**Trulia**")
-            st.json(trulia)
+    st.table(details_df)
 
-        with c3:
-            st.markdown("**GreatSchools / Census**")
-            st.json({
-                "greatschools_status": schools.get("status"),
-                "elementary_rating": schools.get("elementary_rating"),
-                "census_tract": census.get("tract_name"),
-                "median_household_income": census.get("median_household_income"),
-                "geo": geo,
-            })
+    st.subheader("💵 Rent vs Expenses")
 
-    st.info("Some sites may block automation. When that happens, use the source links above and enter manual overrides for price, taxes, HOA, or rent.")
+    rent_vs_expenses_df = pd.DataFrame({
+        "Metric": [
+            "Estimated Monthly Rent",
+            "Total Monthly Expenses",
+            "Estimated Cash Flow",
+        ],
+        "Amount": [
+            f"${metrics['estimated_rent']:,.0f}",
+            f"${metrics['total_monthly_cost']:,.0f}",
+            f"${metrics['cash_flow']:,.0f}",
+        ]
+    })
 
-elif run_analysis and not address.strip():
-    st.warning("Please enter an address first.")
+    st.table(rent_vs_expenses_df)
 
-else:
-    st.markdown(
-        """
-        ### What this app does
-        - Looks up the address and tries to gather property/income/school data
-        - Uses 30% down payment
-        - Includes mortgage, tax, insurance, HOA, maintenance, and vacancy
-        - Compares estimated monthly rent with estimated monthly cost
-        - Gives a rental deal verdict
+# ============================================================
+# RIGHT COLUMN - MONTHLY PAYMENT + VERDICT + FETCH STATUS
+# ============================================================
+with right_col:
+    st.subheader("🏦 Monthly Payment Estimate")
 
-        ### Notes
-        - Maintenance = 10% of estimated rent
-        - Vacancy = 10% of estimated rent
-        - Insurance is entered manually by default
-        - Crime is best handled by reviewing CommunityCrimeMap and Redfin manually, then adjusting the crime score
-        """
-    )
+    monthly_df = pd.DataFrame({
+        "Expense": [
+            "Mortgage (Principal + Interest)",
+            "Property Tax",
+            "Insurance",
+            "HOA",
+            "Maintenance (10% of Rent)",
+            "Vacancy (10% of Rent)",
+            "Total Monthly Cost",
+        ],
+        "Monthly Cost": [
+            f"${metrics['mortgage_pi']:,.0f}",
+            f"${metrics['tax_monthly']:,.0f}",
+            f"${metrics['insurance_monthly']:,.0f}",
+            f"${metrics['hoa_monthly']:,.0f}",
+            f"${metrics['maintenance_monthly']:,.0f}",
+            f"${metrics['vacancy_monthly']:,.0f}",
+            f"${metrics['total_monthly_cost']:,.0f}",
+        ]
+    })
+
+    st.table(monthly_df)
+
+    st.subheader("✅ Investment Verdict")
+
+    verdict_df = pd.DataFrame({
+        "Factor": [
+            "Cash Flow",
+            "Overall Rental Deal",
+        ],
+        "Rating": [
+            "Positive" if metrics["cash_flow"] >= 0 else "Negative",
+            verdict,
+        ]
+    })
+
+    st.table(verdict_df)
+
+    st.subheader("🔎 Fetch Status")
+
+    status_rows = []
+
+    if geo:
+        if geo.get("success"):
+            status_rows.append(["Census Geography", "Success"])
+        else:
+            status_rows.append(["Census Geography", f"Failed: {geo.get('error', 'Unknown error')}"])
+
+    if income:
+        if income.get("success"):
+            status_rows.append(["Household Income", "Success"])
+        else:
+            status_rows.append(["Household Income", f"Failed: {income.get('error', 'Unknown error')}"])
+
+    if rent_fetch:
+        if rent_fetch.get("success"):
+            status_rows.append(["Rent Fetch", "Success"])
+        else:
+            status_rows.append(["Rent Fetch", rent_fetch.get("error", "Failed")])
+
+    if school_fetch:
+        if school_fetch.get("success"):
+            status_rows.append(["School Fetch", "Success"])
+        else:
+            status_rows.append(["School Fetch", school_fetch.get("error", "Failed")])
+
+    if crime_fetch:
+        if crime_fetch.get("success"):
+            status_rows.append(["Crime Fetch", "Success"])
+        else:
+            status_rows.append(["Crime Fetch", crime_fetch.get("error", "Failed")])
+
+    if retain_fetch:
+        if retain_fetch.get("success"):
+            status_rows.append(["Retainability Fetch", "Success"])
+        else:
+            status_rows.append(["Retainability Fetch", retain_fetch.get("error", "Failed")])
+
+    if status_rows:
+        status_df = pd.DataFrame(status_rows, columns=["Source", "Status"])
+        st.table(status_df)
+    else:
+        st.info("No fetches run yet.")
+
+# ============================================================
+# SUMMARY METRICS
+# ============================================================
+st.markdown("---")
+m1, m2, m3, m4 = st.columns(4)
+
+m1.metric("Estimated Rent", f"${metrics['estimated_rent']:,.0f}")
+m2.metric("Monthly Cost", f"${metrics['total_monthly_cost']:,.0f}")
+m3.metric("Cash Flow", f"${metrics['cash_flow']:,.0f}")
+m4.metric("Verdict", verdict)
